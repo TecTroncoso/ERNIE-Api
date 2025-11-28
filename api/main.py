@@ -54,48 +54,38 @@ class ChatCompletionRequest(BaseModel):
     temperature: Optional[float] = 0.7
     stream: Optional[bool] = False
 
-# --- PROCESADO DE TEXTO ---
+# --- PROCESADO DE TEXTO MEJORADO ---
 def format_ernie_response(raw_html: str) -> str:
     """
-    Convierte el HTML sucio de ERNIE en texto Markdown limpio.
+    Convierte el HTML de ERNIE a Markdown de forma segura para streaming.
+    No espera a cerrar tags, simplemente reemplaza estructuras conocidas.
     """
     if not raw_html:
         return ""
 
-    # Decodificar entidades HTML
-    text = html.unescape(str(raw_html))
+    text = str(raw_html)
     
-    # Intentar extraer Thinking y Answer con Regex
-    # Nota: En stream, a veces los tags de cierre </div> no han llegado aún.
-    # Usamos re.DOTALL para multilínea.
+    # 1. Eliminar headers internos de ERNIE que solo dicen "Thinking Process" o "Answer"
+    #    (Para evitar duplicados, ya que pondremos nuestros propios headers)
+    text = re.sub(r'<div class="ernie-section-header">.*?</div>', '', text, flags=re.DOTALL)
+
+    # 2. Reemplazar el inicio del bloque Thinking por nuestro header Markdown
+    #    Detectamos la apertura del div principal de thinking
+    if 'class="ernie-section ernie-thinking"' in text:
+        text = text.replace('<div class="ernie-section ernie-thinking">', '🧠 **Thinking:**\n\n')
     
-    thinking_match = re.search(r'class="ernie-section ernie-thinking".*?class="ernie-section-body">(.*?)</div>', text, re.DOTALL)
-    answer_match = re.search(r'class="ernie-section ernie-answer".*?class="ernie-section-body">(.*?)</div>', text, re.DOTALL)
-    
-    thinking_content = thinking_match.group(1).strip() if thinking_match else ""
-    answer_content = answer_match.group(1).strip() if answer_match else ""
+    # 3. Reemplazar el inicio del bloque Answer por un separador
+    if 'class="ernie-section ernie-answer"' in text:
+        text = text.replace('<div class="ernie-section ernie-answer">', '\n\n---\n\n')
 
-    # Si encontramos estructura, formateamos
-    if thinking_content or answer_content:
-        final_output = ""
-        if thinking_content:
-            final_output += f"🧠 **Thinking:**\n\n{thinking_content}\n\n---\n\n"
-        final_output += f"{answer_content}"
-        
-        # Si hay thinking pero no answer match (aún generando answer), intentamos sacar el resto
-        if thinking_match and not answer_match:
-            # Buscar si hay contenido después del thinking div
-            end_thinking_index = thinking_match.end()
-            remaining = text[end_thinking_index:]
-            # Limpiar tags residuales del remaining
-            clean_remaining = re.sub(r'<[^>]+>', '', remaining).strip()
-            final_output += clean_remaining
+    # 4. Decodificar entidades HTML (&quot;, &gt;, etc.)
+    text = html.unescape(text)
 
-        return final_output
+    # 5. Eliminar TODAS las etiquetas HTML restantes (<div...>, </div>, <br>, etc.)
+    #    Esto limpia el texto crudo.
+    text = re.sub(r'<[^>]+>', '', text)
 
-    # Fallback: Si no hay estructura clara (o el stream está muy crudo), limpiar tags
-    clean_text = re.sub(r'<[^>]+>', '', text) 
-    return clean_text.strip()
+    return text.strip() # No hacemos strip() para no perder espacios finales importantes en stream, pero aquí ayuda a limpiar inicio.
 
 # --- AUXILIAR HISTORIAL ---
 def format_history_prompt(messages: List[Message]) -> str:
@@ -112,7 +102,9 @@ def format_history_prompt(messages: List[Message]) -> str:
                 elif item.type in ["image_url", "video_url"]:
                     content_str += "[Media file] "
         
+        # Limpieza para no confundir al modelo con sus propios separadores anteriores
         content_str = content_str.replace("🧠 **Thinking:**", "").replace("---", "")
+        
         if content_str.strip():
             history_text += f"{role_name}: {content_str}\n"
     
@@ -120,9 +112,8 @@ def format_history_prompt(messages: List[Message]) -> str:
         history_text = "--- Context ---\n" + history_text + "--- Request ---\n"
     return history_text
 
-# --- GENERADOR DE STREAM ---
+# --- GENERADOR DE STREAM MEJORADO ---
 async def generate_stream(gradio_app, final_prompt, files_to_upload, model_name):
-    # Usamos submit() para obtener un Job que se puede iterar
     job = gradio_app.submit(
         message={"text": final_prompt, "files": files_to_upload},
         api_name="/chat"
@@ -132,36 +123,41 @@ async def generate_stream(gradio_app, final_prompt, files_to_upload, model_name)
     chat_id = f"chatcmpl-{int(time.time())}"
     created_time = int(time.time())
 
-    # Iteramos sobre el generador del trabajo
     for result in job:
-        # result suele ser una tupla/lista, el último elemento es el mensaje actual del bot
         raw_response = str(result[-1]) if isinstance(result, (list, tuple)) else str(result)
         
-        # Limpiamos el HTML completo actual
         current_formatted_text = format_ernie_response(raw_response)
         
-        # Calculamos solo la parte nueva (delta)
-        if len(current_formatted_text) > len(previous_text):
-            delta_content = current_formatted_text[len(previous_text):]
-            previous_text = current_formatted_text
-            
-            chunk = {
-                "id": chat_id,
-                "object": "chat.completion.chunk",
-                "created": created_time,
-                "model": model_name,
-                "choices": [{
-                    "index": 0,
-                    "delta": {"content": delta_content},
-                    "finish_reason": None
-                }]
-            }
-            yield f"data: {json.dumps(chunk)}\n\n"
-            
-            # Pequeña pausa para no saturar el loop si el modelo va muy rápido
-            await asyncio.sleep(0.01)
+        # --- PROTECCIÓN CONTRA JITTER ---
+        # Si el texto nuevo es más corto que el anterior, es un glitch del parser HTML.
+        # Ignoramos este frame y esperamos al siguiente donde el texto esté completo.
+        if len(current_formatted_text) < len(previous_text):
+            continue
 
-    # Chunk final para indicar fin
+        # Calculamos el delta solo si el texto ha crecido
+        if len(current_formatted_text) > len(previous_text):
+            # Solo enviamos la parte nueva
+            delta_content = current_formatted_text[len(previous_text):]
+            
+            # Verificación extra: a veces el diff es solo un salto de línea basura
+            if delta_content:
+                previous_text = current_formatted_text
+                
+                chunk = {
+                    "id": chat_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_time,
+                    "model": model_name,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": delta_content},
+                        "finish_reason": None
+                    }]
+                }
+                yield f"data: {json.dumps(chunk)}\n\n"
+                await asyncio.sleep(0.001) # Micro pausa para estabilidad
+
+    # Chunk final
     final_chunk = {
         "id": chat_id,
         "object": "chat.completion.chunk",
@@ -203,7 +199,6 @@ async def chat_completions(request: ChatCompletionRequest):
 
     final_prompt = context_header + current_text
 
-    # --- LÓGICA DE STREAMING ---
     if request.stream:
         print(f"🚀 Iniciando Stream ERNIE | Archivos: {len(files_to_upload)}")
         return StreamingResponse(
@@ -211,24 +206,20 @@ async def chat_completions(request: ChatCompletionRequest):
             media_type="text/event-stream"
         )
 
-    # --- LÓGICA SIN STREAMING (Original) ---
+    # Fallback No-Stream
     try:
-        print(f"🚀 Enviando a ERNIE (No-Stream) | Archivos: {len(files_to_upload)}")
-        
-        # predict() bloquea hasta el final
+        print(f"🚀 Enviando a ERNIE (No-Stream)...")
         result = gradio_app.predict(
             message={"text": final_prompt, "files": files_to_upload},
             api_name="/chat"
         )
-        
         raw_response = str(result[-1]) if isinstance(result, (list, tuple)) else str(result)
         formatted_text = format_ernie_response(raw_response)
-
     except Exception as e:
-        print(f"❌ Error en Gradio Predict: {e}")
+        print(f"❌ Error: {e}")
         global client
         client = None 
-        raise HTTPException(status_code=500, detail=f"Error del modelo: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
     return {
         "id": f"chatcmpl-{int(time.time())}",
@@ -240,21 +231,8 @@ async def chat_completions(request: ChatCompletionRequest):
             "message": {"role": "assistant", "content": formatted_text},
             "finish_reason": "stop"
         }],
-        "usage": {
-            "prompt_tokens": len(final_prompt),
-            "completion_tokens": len(formatted_text),
-            "total_tokens": 0
-        }
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     }
 
-@app.get("/")
-def home():
-    return {"status": "alive", "message": "ERNIE Bot is running"}
-
-@app.get("/health")
-def health_check():
-    return {"status": "ok"}
-    
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
