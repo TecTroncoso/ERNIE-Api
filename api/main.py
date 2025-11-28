@@ -234,5 +234,14 @@ async def chat_completions(request: ChatCompletionRequest):
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     }
 
+@app.get("/")
+def home():
+    return {"status": "alive", "message": "ERNIE Bot is running"}
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
+    
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
